@@ -1,0 +1,25 @@
+[package]
+name = "benchshm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "svr"
+path = "src/bin/svr.rs"
+
+[[bin]]
+name = "cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+lexopt = "0.2"
+anyhow = "1.0"
+shared_memory = "0.12"
+rand = "0.8"
+crossbeam-utils = "0.8"
+libc = "0.2"
+errno = "0.2"
+
+[profile.release]
+debug = true
+
