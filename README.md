@@ -120,6 +120,44 @@ disconnected: num is 100000, sum is 4999950000, duration is 27.585196ms, avg lat
 
 ```
 
+With NUMA:
+
+If we use `numactl --cpubind=$NODE --membind=$NODE` to assign the server and client to same node,
+we can achieve about 8x speed-up as below:
+
+```shell
+# server
+[benchshm]# numactl --cpubind=0 --membind=0 -- $PWD/target/release/svr --addr=shm:./shm.flk
+Listening at (Shm)(./shm.flk)
+disconnected from client 2272834290, sum is 499999500000, duration is 35.698676ms
+disconnected from client 2880858173, sum is 499999500000, duration is 36.361289ms
+disconnected from client 296780903, sum is 499999500000, duration is 37.025196ms
+disconnected from client 1456887215, sum is 499999500000, duration is 304.132352ms
+disconnected from client 424466449, sum is 499999500000, duration is 306.25606ms
+disconnected from client 3804013070, sum is 499999500000, duration is 300.318533ms
+
+# client
+[benchshm]# numactl --cpubind=0 --membind=0 -- $PWD/target/release/cli --addr=shm:./shm.flk -n 1000000 -v 1
+connecting (Shm)(./shm.flk)
+disconnected: num is 1000000, sum is 499999500000, duration is 35.700646ms, avg latency is 35ns
+[benchshm]# numactl --cpubind=0 --membind=0 -- $PWD/target/release/cli --addr=shm:./shm.flk -n 1000000 -v 1
+connecting (Shm)(./shm.flk)
+disconnected: num is 1000000, sum is 499999500000, duration is 36.364059ms, avg latency is 36ns
+[benchshm]# numactl --cpubind=0 --membind=0 -- $PWD/target/release/cli --addr=shm:./shm.flk -n 1000000 -v 1
+connecting (Shm)(./shm.flk)
+disconnected: num is 1000000, sum is 499999500000, duration is 37.027169ms, avg latency is 37ns
+[benchshm]# numactl --cpubind=1 --membind=1 -- $PWD/target/release/cli --addr=shm:./shm.flk -n 1000000 -v 1
+connecting (Shm)(./shm.flk)
+disconnected: num is 1000000, sum is 499999500000, duration is 304.132953ms, avg latency is 304ns
+[benchshm]# numactl --cpubind=1 --membind=1 -- $PWD/target/release/cli --addr=shm:./shm.flk -n 1000000 -v 1
+connecting (Shm)(./shm.flk)
+disconnected: num is 1000000, sum is 499999500000, duration is 306.257327ms, avg latency is 306ns
+[benchshm]# numactl --cpubind=1 --membind=1 -- $PWD/target/release/cli --addr=shm:./shm.flk -n 1000000 -v 1
+connecting (Shm)(./shm.flk)
+disconnected: num is 1000000, sum is 499999500000, duration is 300.319825ms, avg latency is 300ns
+
+```
+
 Notes: 
 
 `v1`: sync response per request(in another word, no pipeline).
