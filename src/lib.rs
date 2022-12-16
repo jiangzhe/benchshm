@@ -1,22 +1,227 @@
-use anyhow::{anyhow, Result};
 use std::io::{self, Read, Write};
-// use libc::{mkfifo, mode_t, EACCES, EEXIST, ENOENT};
-// use std::ffi::CString;
-// use std::path::Path;
-// use std::fs::{File, OpenOptions};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::mem::{self, align_of, MaybeUninit};
+use libc::{
+    pthread_mutex_init,
+    pthread_mutex_lock,
+    pthread_mutex_t,
+    pthread_mutex_unlock,
+    pthread_mutexattr_init,
+    pthread_mutexattr_setpshared,
+    pthread_mutexattr_t,
+    pthread_condattr_init,
+    pthread_condattr_setpshared,
+    pthread_condattr_t,
+    pthread_cond_init,
+    pthread_cond_signal,
+    pthread_cond_wait,
+    pthread_cond_t,
+    PTHREAD_PROCESS_SHARED,
+};
+use thiserror::Error;
 
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("unknown protocol")]
+    UnknownProtocol,
+    #[error("unknown state")]
+    UnknownState,
+    #[error("fail to initialize pthread_mutexattr_t")]
+    FailInitPthreadMutexAttr,
+    #[error("fail to setup pthread_mutexattr_t")]
+    FailSetupPthreadMutexAttr,
+    #[error("fail to initialize pthread_mutex_t")]
+    FailInitPthreadMutex,
+    #[error("fail to initialize pthread_condattr_t")]
+    FailInitPthreadCondAttr,
+    #[error("fail to setup pthread_condattr_t")]
+    FailSetupPthreadCondAttr,
+    #[error("fail to initialize pthread_cond_t")]
+    FailInitPthreadCond,
+    #[error("fail to lock pthread_mutex_t with code {0}")]
+    FailPthreadLock(i32),
+    #[error("fail to unlock pthread_mutex_t with code {0}")]
+    FailPthreadUnlock(i32),
+    #[error("fail to wait pthread_cond_t with code {0}")]
+    FailPthreadWait(i32),
+    #[error("fail to signal pthread_cond_t with code {0}")]
+    FailPthreadSignal(i32),
+}
 
-pub mod state {
-    pub const ACCEPTING: u8 = 0;
-    pub const CONNECTING: u8 = 1;
-    pub const WAIT_CLI_REQ: u8 = 2;
-    pub const WAIT_SVR_RESP: u8 = 3;
-    pub const DISCONNECTED: u8 = 4;
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CabinState {
+    AcceptingSpin = 0,
+    AcceptingYield = 1,
+    Connecting = 2,
+    WaitReqSpin = 3,
+    WaitReqYield = 4,
+    WaitRespSpin = 5,
+    WaitRespYield = 6,
+    Disconnected = 7,
+}
+
+impl From<u8> for CabinState {
+    #[inline]
+    fn from(src: u8) -> Self {
+        use CabinState::*;
+        match src {
+            0 => AcceptingSpin,
+            1 => AcceptingYield,
+            2 => Connecting,
+            3 => WaitReqSpin,
+            4 => WaitReqYield,
+            5 => WaitRespSpin,
+            6 => WaitRespYield,
+            7 | _ => Disconnected,
+        }
+    }
+}
+
+pub struct CabinGuard;
+
+pub struct LockGuard<'a, T, U> {
+    cabin: &'a Cabin<T, U>,
+}
+
+impl<'a, T, U> LockGuard<'a, T, U> {
+    pub fn wait(&self) -> Result<()> {
+        self.cabin.wait()
+    }
+
+    pub fn signal(&self) -> Result<()> {
+        self.cabin.signal()
+    }
+}
+
+impl<'a, T, U> Drop for LockGuard<'a, T, U> {
+    fn drop(&mut self) {
+        self.cabin.unlock().unwrap();
+    }
+}
+
+#[repr(C)]
+pub struct Cabin<T, U> {
+    mutex: UnsafeCell<pthread_mutex_t>,
+    cond: UnsafeCell<pthread_cond_t>,
+    state: AtomicU8,
+    id: UnsafeCell<u32>,
+    req: UnsafeCell<T>,
+    resp: UnsafeCell<U>,
+}
+
+impl<T, U> Cabin<T, U> {
 
     #[inline]
-    pub unsafe fn set_state(state_ptr: *mut u8, new_state: u8) -> u8 {
-        state_ptr.write_volatile(new_state);
-        new_state
+    pub unsafe fn new<'a>(mem: *mut u8, _guard: &'a CabinGuard) -> Result<&'a Self> {
+        let padding = mem.align_offset(align_of::<Self>());
+        let ptr = mem.add(padding);
+        let cabin = mem::transmute::<*mut u8, &mut Self>(ptr);
+        // initialize pthread mutex
+        let mut lock_attr: pthread_mutexattr_t = MaybeUninit::zeroed().assume_init();
+        if pthread_mutexattr_init(&mut lock_attr) != 0 {
+            return Err(Error::FailInitPthreadMutexAttr)
+        }
+        if pthread_mutexattr_setpshared(&mut lock_attr, PTHREAD_PROCESS_SHARED) != 0 {
+            return Err(Error::FailSetupPthreadMutexAttr)
+        }
+        if pthread_mutex_init(cabin.mutex.get(), &lock_attr) != 0 {
+            return Err(Error::FailInitPthreadMutex)
+        }
+        // initialize pthread cond
+        let mut cond_attr: pthread_condattr_t = MaybeUninit::zeroed().assume_init();
+        if pthread_condattr_init(&mut cond_attr) != 0 {
+            return Err(Error::FailInitPthreadCondAttr)
+        }
+        if pthread_condattr_setpshared(&mut cond_attr, PTHREAD_PROCESS_SHARED) != 0 {
+            return Err(Error::FailSetupPthreadCondAttr)
+        }
+        if pthread_cond_init(cabin.cond.get(), &cond_attr) != 0 {
+            return Err(Error::FailInitPthreadCond)
+        }
+        Ok(cabin)
+    }
+
+    #[inline]
+    pub unsafe fn from_existing<'a>(mem: *mut u8, _guard: &'a CabinGuard) -> &'a Self {
+        let padding = mem.align_offset(align_of::<Self>());
+        let ptr = mem.add(padding);
+        mem::transmute::<*mut u8, &Self>(ptr)
+    }
+
+    pub fn id(&self) -> u32 {
+        unsafe { self.id.get().read_volatile() }
+    }
+
+    pub fn set_id(&self, id: u32) {
+        unsafe { self.id.get().write_volatile(id) }
+    }
+
+    pub fn req(&self) -> T where T: Copy {
+        unsafe { *self.req.get() }
+    }
+
+    pub fn set_req(&self, req: T) {
+        unsafe { self.req.get().write_volatile(req) }
+    }
+
+    pub fn resp(&self) -> U where U: Copy {
+        unsafe { *self.resp.get() }
+    }
+
+    pub fn set_resp(&self, resp: U) {
+        unsafe { self.resp.get().write_volatile(resp) }
+    }
+
+    #[inline]
+    pub fn load_state(&self, order: Ordering) -> CabinState {
+        self.state.load(order).into()
+    }
+
+    #[inline]
+    pub fn cas_state(&self, current: CabinState, new: CabinState) -> std::result::Result<CabinState, CabinState> {
+        self.state.compare_exchange_weak(current as u8, new as u8, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|s| s.into())
+            .map_err(|s| s.into())
+    }
+
+    #[inline]
+    pub fn lock(&self) -> Result<LockGuard<'_, T, U>> {
+        let res = unsafe { pthread_mutex_lock(self.mutex.get()) };
+        if res != 0 {
+            return Err(Error::FailPthreadLock(res))
+        }
+        Ok(LockGuard{cabin: self})
+    }
+
+    #[inline]
+    fn unlock(&self) -> Result<()> {
+        let res = unsafe { pthread_mutex_unlock(self.mutex.get()) };
+        if res != 0 {
+            return Err(Error::FailPthreadUnlock(res))
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn wait(&self) -> Result<()> {
+        let res = unsafe { pthread_cond_wait(self.cond.get(), self.mutex.get()) };
+        if res != 0 {
+            return Err(Error::FailPthreadWait(res))
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn signal(&self) -> Result<()> {
+        let res = unsafe { pthread_cond_signal(self.cond.get()) };
+        if res != 0 {
+            return Err(Error::FailPthreadSignal(res))
+        }
+        Ok(())
     }
 }
 
@@ -25,7 +230,6 @@ pub enum ConnKind {
     Tcp,
     Unix,
     Shm,
-    // Pipe,
 }
 
 #[inline]
@@ -34,17 +238,16 @@ pub fn parse_conn_kind(s: &str) -> Result<(ConnKind, String)> {
         ("tcp", ConnKind::Tcp), 
         ("unix", ConnKind::Unix), 
         ("shm", ConnKind::Shm),
-        // ("pipe", ConnKind::Pipe),
     ] {
         if s.starts_with(proto) {
             return Ok((kind, s[proto.len()+1..].to_string()))
         }
     }
-    Err(anyhow!("unexpected protocol type: {}", s))
+    Err(Error::UnknownProtocol)
 }
 
 #[inline]
-pub fn client_conn<T>(mut conn: T, value: Option<u64>, num: u32) -> Result<u64> 
+pub fn client_conn<T>(mut conn: T, value: Option<u64>, num: u32) -> anyhow::Result<u64> 
 where
     T: Read + Write,
 {
@@ -88,7 +291,7 @@ where
 
 
 #[inline]
-pub fn server_conn<T>(mut conn: T) -> Result<u64> 
+pub fn server_conn<T>(mut conn: T) -> anyhow::Result<u64> 
 where
     T: Read + Write,
 {
@@ -108,45 +311,3 @@ where
     }
     Ok(sum)
 }
-
-// #[inline]
-// pub fn create_fifo<P: AsRef<Path>>(path: P, mode: Option<u32>) -> io::Result<()> {
-//     let path = CString::new(path.as_ref().to_str().unwrap())?;
-//     let mode = mode.unwrap_or(0o644);
-//     let res = unsafe { mkfifo(path.as_ptr(), mode as mode_t) };
-//     if res == 0 {
-//         return Ok(())
-//     }
-//     let error = errno::errno();
-//     match error.0 {
-//         EACCES => Err(io::Error::new(
-//             io::ErrorKind::PermissionDenied,
-//             format!("could not open {:?}: {}", path, error),
-//         )),
-//         EEXIST => Err(io::Error::new(
-//             io::ErrorKind::AlreadyExists,
-//             format!("could not open {:?}: {}", path, error),
-//         )),
-//         ENOENT => Err(io::Error::new(
-//             io::ErrorKind::NotFound,
-//             format!("could not open {:?}: {}", path, error),
-//         )),
-//         _ => Err(io::Error::new(
-//             io::ErrorKind::Other,
-//             format!("could not open {:?}: {}", path, error),
-//         ))
-//     }
-// }
-
-// pub fn open_read<P: AsRef<Path>>(path: P) -> io::Result<File> {
-//     OpenOptions::new()
-//         .read(true)
-//         .open(path)
-// }
-
-// pub fn open_write<P: AsRef<Path>>(path: P) -> io::Result<File> {
-//     OpenOptions::new()
-//         .write(true)
-//         .append(true)
-//         .open(path)
-// }
