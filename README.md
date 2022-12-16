@@ -166,6 +166,10 @@ Notes:
 
 In case of shared memory, `v2` is identical to `v1`.
 
+Update on 2022.12.16:
+
+Inter-process mutex is implemented and used via `--spin-only=false`, it shows if both server and client sides set `--spin-only=false`, latency will increase until microseconds. If at lease one side set `--spin-only=true`, the results are similar to original ones.
+
 ## Conclusion
 
 Shared memory is faster than both TCP and Unix Socket by one or two orders of magnitude.
